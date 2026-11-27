@@ -159,6 +159,34 @@ jobs:
           bash device/scripts/build-nx769j-metal.sh "$PWD/unixnu"
           ls -lR device/.cache/gpu-user/out | head -80
 
+      - name: Ad-hoc sign the GPU user lands
+        run: |
+          set -euxo pipefail
+          OUT=device/.cache/gpu-user/out
+          if [ -d "$OUT/NativeAdrenoMetal.bundle" ]; then
+            codesign --force --sign - --timestamp=none "$OUT/NativeAdrenoMetal.bundle"
+          fi
+          for f in "$OUT/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib" "$OUT/vktest" "$OUT/mtltest"; do
+            if [ -f "$f" ]; then codesign --force --sign - --timestamp=none "$f"; fi
+          done
+          python3 - <<'PY'
+          import json, pathlib, re, subprocess
+          out = pathlib.Path('device/.cache/gpu-user/out')
+          paths = [out / 'NativeAdrenoMetal.bundle/NativeAdrenoMetal',
+                   out / 'NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib',
+                   out / 'vktest', out / 'mtltest']
+          result = {}
+          for path in paths:
+              if not path.is_file():
+                  continue
+              info = subprocess.run(['codesign', '--display', '--verbose=4', str(path)],
+                                    capture_output=True, text=True)
+              match = re.search(r'CDHash=([0-9a-f]+)', info.stderr)
+              result[path.name] = match.group(1) if match else None
+          (out / 'cdhashes.json').write_text(json.dumps(result, indent=1) + '\n')
+          print(result)
+          PY
+
       - name: Dump diagnostics on failure
         if: failure()
         run: |
@@ -175,4 +203,4 @@ jobs:
         with:
           name: nx769j-gpu-user
           path: device/.cache/gpu-user/out
-          if-no-files-found: never
+          if-no-files-found: error
