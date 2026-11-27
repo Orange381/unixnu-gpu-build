@@ -4,58 +4,52 @@ name: gpu-userlands
 
 on:
   workflow_dispatch:
-    inputs:
-      device_ref:
-        description: Branch or tag of the device repository
-        default: main
-        required: true
-      unixnu_ref:
-        description: Branch or tag of UniXNU
-        default: main
-        required: true
 
 permissions:
   contents: read
-
-env:
-  DEVICE_REPO: xwsjjctz/UniXNU-NX769J
-  UNIXNU_REPO: UniXNU/UniXNU
-  DEVICE_REF: ${{ inputs.device_ref || 'main' }}
-  UNIXNU_REF: ${{ inputs.unixnu_ref || 'main' }}
-  # Pins demanded by the device repository's scripts/build-nx769j-metal.sh.
-  ADRENOMETAL_PIN: c6d29caad6d880cc8204ebe3bc34d77479a3255d
-  ADRENOPM4_PIN: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
-  GOPFRAMEBUFFER_PIN: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
-  METAL2VULKAN_PIN: 720ef1ce9ae2a2068999a8675717418b9416283e
-  MESA_PIN: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
 
 jobs:
   userlands:
     runs-on: macos-26
     timeout-minutes: 180
+    env:
+      DEVICE_REPO: xwsjjctz/UniXNU-NX769J
+      UNIXNU_REPO: UniXNU/UniXNU
+      ADRENOMETAL_PIN: c6d29caad6d880cc8204ebe3bc34d77479a3255d
+      ADRENOPM4_PIN: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
+      GOPFRAMEBUFFER_PIN: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
+      METAL2VULKAN_PIN: 720ef1ce9ae2a2068999a8675717418b9416283e
+      MESA_PIN: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
     steps:
+      - name: Show the run environment
+        run: |
+          echo "runner: $RUNNER_OS $RUNNER_ARCH"
+          sw_vers
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          echo "pins: $ADRENOMETAL_PIN $ADRENOPM4_PIN $GOPFRAMEBUFFER_PIN $METAL2VULKAN_PIN $MESA_PIN"
+
       - name: Check out the device repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.DEVICE_REPO }}
-          ref: ${{ env.DEVICE_REF }}
+          repository: xwsjjctz/UniXNU-NX769J
+          ref: main
           path: device
           persist-credentials: false
 
       - name: Check out UniXNU
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.UNIXNU_REPO }}
-          ref: ${{ env.UNIXNU_REF }}
+          repository: UniXNU/UniXNU
+          ref: main
           path: unixnu
           persist-credentials: false
 
-      - name: Fetch the submodules the user land build needs
+      - name: Fetch and pin the submodules
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Submodules::$BASH_COMMAND"' ERR
+          set -euxo pipefail
           for path in drivers/AdrenoMetal drivers/Adreno740 kits/AdrenoPM4 drivers/GopFramebuffer; do
-            git -C unixnu submodule update --init --depth 1 "$path"
+            git -C unixnu submodule update --init --depth 1 "$path" || git -C unixnu submodule update --init "$path"
           done
           git -C unixnu/drivers/AdrenoMetal fetch --depth 1 origin "$ADRENOMETAL_PIN"
           git -C unixnu/drivers/AdrenoMetal checkout --detach "$ADRENOMETAL_PIN"
@@ -66,32 +60,37 @@ jobs:
 
       - name: Stage the .cache/gpu-user inputs
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Stage inputs::$BASH_COMMAND"' ERR
+          set -euxo pipefail
           C=$PWD/device/.cache/gpu-user
           mkdir -p "$C/nativemetal" "$C/AdrenoPM4" "$C/NativeMobileDisplay"
           git -C unixnu/drivers/AdrenoMetal archive "$ADRENOMETAL_PIN" | tar -x -C "$C/nativemetal"
           git -C unixnu/kits/AdrenoPM4 archive "$ADRENOPM4_PIN" | tar -x -C "$C/AdrenoPM4"
           cp unixnu/drivers/GopFramebuffer/NativeGOPWire.h "$C/NativeMobileDisplay/NativeGOPWire.h"
-          git clone --filter=blob:none https://github.com/steelbrain/metal2vulkan "$C/metal2vulkan"
-          git -C "$C/metal2vulkan" checkout --detach "$METAL2VULKAN_PIN"
+          rm -rf "$C/metal2vulkan"
+          git init "$C/metal2vulkan"
+          git -C "$C/metal2vulkan" remote add origin https://github.com/steelbrain/metal2vulkan
+          git -C "$C/metal2vulkan" fetch --depth 1 origin "$METAL2VULKAN_PIN"
+          git -C "$C/metal2vulkan" checkout --detach FETCH_HEAD
           ls -l "$C"
 
       - name: Clone Mesa at its pinned revision
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Mesa clone::$BASH_COMMAND"' ERR
+          set -euxo pipefail
           M=$PWD/unixnu/.cache/mesa-work
+          rm -rf "$M"
           git init "$M"
           git -C "$M" remote add origin https://github.com/mesa3d/mesa
-          git -C "$M" fetch --depth 1 origin "$MESA_PIN"
-          git -C "$M" checkout --detach FETCH_HEAD
+          if ! git -C "$M" fetch --depth 1 origin "$MESA_PIN"; then
+            echo "::warning::shallow fetch by sha failed, retrying with a blobless full fetch"
+            git -C "$M" fetch --filter=blob:none --tags origin
+          fi
+          git -C "$M" checkout --detach "$MESA_PIN"
+          git -C "$M" rev-parse HEAD
 
       - name: Install the build tools
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Tools::$BASH_COMMAND"' ERR
-          brew install bison glslang shaderc spirv-tools llvm
+          set -euxo pipefail
+          brew install bison glslang shaderc spirv-tools llvm || brew upgrade bison glslang shaderc spirv-tools llvm || true
           python3 -m venv unixnu/.cache/mesa-venv
           unixnu/.cache/mesa-venv/bin/pip install --upgrade pip
           unixnu/.cache/mesa-venv/bin/pip install meson ninja
@@ -101,7 +100,6 @@ jobs:
       - name: Add the iOS 16 target to build-turnip-darwin.py
         run: |
           set -euo pipefail
-          trap 'echo "::error title=Patch turnip script::$BASH_COMMAND"' ERR
           python3 - <<'PY'
           from pathlib import Path
           p = Path('unixnu/scripts/build-turnip-darwin.py')
@@ -109,11 +107,10 @@ jobs:
           if "'ios16'" not in t:
               t = t.replace("choices=('host', 'ios', 'ios27', 'macos27')",
                             "choices=('host', 'ios', 'ios16', 'ios27', 'macos27')")
-              t = t.replace("'ios': 'build/mesa-tu-ios',", "'ios': 'build/mesa-tu-ios', 'ios16': 'build/mesa-tu-ios16',")
+              t = t.replace("'ios': 'build/mesa-tu-ios',",
+                            "'ios': 'build/mesa-tu-ios', 'ios16': 'build/mesa-tu-ios16',")
               t = t.replace("if args.target in ('ios', 'ios27', 'macos27'):",
                             "if args.target in ('ios', 'ios16', 'ios27', 'macos27'):")
-              t = t.replace("sdk_name = 'macosx' if args.target == 'macos27' else 'iphoneos'",
-                            "sdk_name = 'macosx' if args.target == 'macos27' else 'iphoneos'")
               t = t.replace("triple = {'ios': 'arm64-apple-ios17.0',",
                             "triple = {'ios': 'arm64-apple-ios17.0', 'ios16': 'arm64-apple-ios16.0',")
               p.write_text(t)
@@ -122,24 +119,31 @@ jobs:
 
       - name: Build Turnip for iOS 16
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Turnip::$BASH_COMMAND"' ERR
+          set -euxo pipefail
           python3 unixnu/scripts/build-turnip-darwin.py --target ios16
           ls -l unixnu/build/mesa-tu-ios16/src/freedreno/vulkan/libvulkan_freedreno.dylib
 
       - name: Build the GPU user lands
         run: |
-          set -euo pipefail
-          trap 'echo "::error title=Userlands::$BASH_COMMAND"' ERR
+          set -euxo pipefail
           bash device/scripts/build-nx769j-metal.sh "$PWD/unixnu"
-          echo '### Output' >> "$GITHUB_STEP_SUMMARY"
+          ls -lR device/.cache/gpu-user/out | head -80
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo '### Diagnostics' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          (cd device/.cache/gpu-user/out && ls -lR | head -60) >> "$GITHUB_STEP_SUMMARY"
+          (cd unixnu && git log --oneline -1) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          (cd unixnu/drivers/AdrenoMetal && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          (cd unixnu/.cache/mesa-work && git rev-parse HEAD && git log --oneline -1) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the user lands
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: nx769j-gpu-user
           path: device/.cache/gpu-user/out
           if-no-files-found: error
+
