@@ -120,7 +120,7 @@ jobs:
           brew install bison glslang shaderc spirv-tools llvm || brew upgrade bison glslang shaderc spirv-tools llvm || true
           python3 -m venv unixnu/.cache/mesa-venv
           unixnu/.cache/mesa-venv/bin/pip install --upgrade pip
-          unixnu/.cache/mesa-venv/bin/pip install meson ninja
+          unixnu/.cache/mesa-venv/bin/pip install packaging setuptools wheel mako pyyaml meson ninja
           rustup target add aarch64-apple-ios
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
 
