@@ -144,17 +144,24 @@ jobs:
           PY
           # 2. attach as a raw disk image and make the container fill the device.
           # -nomount: the file is all zeroes, so there is no filesystem to mount
-          #   yet and hdiutil would otherwise fail with "no mountable file systems".
+          # yet and hdiutil would otherwise fail with "no mountable file systems".
           hdiutil attach -nomount -nobrowse -owners off -plist \
             -imagekey diskimage-class=CRawDiskImage "$raw" > "$RUNNER_TEMP/attach.plist"
           device=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][0]['dev-entry'])" "$RUNNER_TEMP/attach.plist")
           echo "attached $device"
           diskutil apfs create "$device" OwnerData
-          volume=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][-1]['dev-entry'])" "$RUNNER_TEMP/attach.plist")
-          # 3. mount it and copy the OS volume's private/var in
-          mount="$RUNNER_TEMP/seed-work/mount"
-          mkdir -p "$mount"
-          diskutil mount -mountPoint "$mount" "$volume"
+          # 3. the volume the command just created is already mounted at
+          # /Volumes/OwnerData; take its device from df rather than from the
+          # attach plist, whose last entry is the APFS physical store (disk9),
+          # not the volume (disk10s1).
+          mount="/Volumes/OwnerData"
+          for _ in $(seq 1 15); do
+            [ -d "$mount" ] && break
+            sleep 2
+          done
+          [ -d "$mount" ] || { echo "::error title=Mount the new volume::$mount never appeared"; exit 1; }
+          volume=$(df "$mount" | tail -1 | awk '{print $1}')
+          echo "volume $volume mounted at $mount"
           rsync -a --exclude 'staged_system_apps' \
             "$RUNNER_TEMP/os-mount/private/var/" "$mount/"
           mkdir -p "$mount/keybags" "$mount/mobile/tmp" "$mount/tmp" "$mount/run"
