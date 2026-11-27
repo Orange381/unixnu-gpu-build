@@ -4,18 +4,18 @@ name: Data seed
 # --data-ramdisk), built on a hosted macOS runner because every step needs
 # hdiutil and diskutil apfs.
 #
-# Two phases, because a 100 GiB raw image does not fit on a hosted runner:
+# A hosted runner cannot create a 100 GiB raw image (`hdiutil create -type
+# UDTO`), and `hdiutil resize` refuses a UDTO image (exit 22), so the container
+# is made directly on a sparse file instead:
 #
-#   1. build a small seed the normal way (scripts/build-data-seed.py at BASE_MIB)
-#   2. extend only the image *file* with `hdiutil resize` (APFS makes the
-#      extension sparse, so the runner's disk usage stays at BASE_MIB), grow the
-#      APFS container to fill it with `diskutil apfs resizeContainer ... 0`, and
-#      re-pack with DarwinBoot's DBRDISK1 writer -- the packed seed only carries
-#      non-zero pages, so the artifact stays small while the volume the kernel
-#      presents is the full size asked for.
-#
-# If step 2 fails the workflow still uploads the BASE_MIB seed so a bootable
-# build is never blocked on the resize.
+#   1. truncate a raw image file to the requested size -- APFS keeps that sparse,
+#      so the runner's disk usage is only what gets written
+#   2. hdiutil attach it as a CRawDiskImage and `diskutil apfs create` a
+#      container + OwnerData volume filling the whole device
+#   3. copy the OS volume's private/var in, add the directories userland expects
+#   4. detach and pack with DarwinBoot's DBRDISK1 writer -- only non-zero pages
+#      travel, so the artifact stays small while the volume the kernel presents
+#      is the full size asked for
 #
 # The seed is rebuilt from scratch on every run, so the Data volume UUID changes
 # with it; the report prints the UUID that this run produced.
@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       size_mib:
-        description: Final Data container size in MiB (the volume the kernel presents)
+        description: Data container size in MiB (the volume the kernel presents)
         required: true
         default: "102400"
 
@@ -39,8 +39,6 @@ env:
   OS_MEMBER: 096-04088-077.dmg
   IPSW_URL: https://updates.cdn-apple.com/2023SpringFCS/fullrestores/032-85130/6AB0D10A-8AF9-4F6C-8CF5-A1B315CABE88/iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
   SIZE_MIB: ${{ inputs.size_mib || '102400' }}
-  # The size the image is actually created at; the rest is a sparse extension.
-  BASE_MIB: "8192"
 
 jobs:
   seed:
@@ -128,55 +126,54 @@ jobs:
           hdiutil attach -readonly -nobrowse -owners off \
             -mountpoint "$RUNNER_TEMP/os-mount" "$RUNNER_TEMP/os/$OS_MEMBER"
 
-      - name: Build the base seed
-        id: base
+      - name: Build the seed on a sparse image at the requested size
+        id: seed
         run: |
           set -euo pipefail
-          trap 'echo "::error title=Build the base seed::$BASH_COMMAND"' ERR
-          mkdir -p "$RUNNER_TEMP/out"
-          python3 device/scripts/build-data-seed.py \
-            --os-mount "$RUNNER_TEMP/os-mount" \
-            --output "$RUNNER_TEMP/out/nx769j-data.dbr" \
-            --size-mib "$BASE_MIB" \
-            --unixnu unixnu \
-            --work "$RUNNER_TEMP/seed-work" > "$RUNNER_TEMP/out/build-data-seed.log" 2>&1
-          cat "$RUNNER_TEMP/out/build-data-seed.log"
-          cp "$RUNNER_TEMP/out/nx769j-data.dbr.json" "$RUNNER_TEMP/out/base.json"
-          df -h "$RUNNER_TEMP" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Grow the image and the container to the requested size
-        id: grow
-        run: |
-          set -euo pipefail
-          image="$RUNNER_TEMP/seed-work/owner-data.cdr"
-          echo "grow: extending $image to ${SIZE_MIB}m"
-          hdiutil resize -size "${SIZE_MIB}m" -imagekey diskimage-class=CRawDiskImage "$image"
-          ls -l "$image"
-          mount="$RUNNER_TEMP/seed-work/mount2"
-          mkdir -p "$mount"
-          attached="$RUNNER_TEMP/attach.plist"
-          hdiutil attach -nobrowse -owners off -plist "$image" > "$attached"
-          device=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][0]['dev-entry'])" "$attached")
-          echo "grow: container on $device"
-          diskutil apfs resizeContainer "$device" 0
-          hdiutil detach "$device" -force
-          python3 - "$image" "$SIZE_MIB" <<'PY'
+          trap 'echo "::error title=Build the seed::$BASH_COMMAND"' ERR
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/seed-work"
+          raw="$RUNNER_TEMP/seed-work/owner-data.cdr"
+          # 1. sparse raw image of the final size
+          python3 - "$raw" "$SIZE_MIB" <<'PY'
           import sys
           from pathlib import Path
-          image, want = Path(sys.argv[1]), int(sys.argv[2]) * 1024 * 1024
-          header = image.open('rb').read(4096)
-          assert header[32:36] == b'NXSB', 'not an APFS container'
-          block = int.from_bytes(header[36:40], 'little')
-          blocks = int.from_bytes(header[40:48], 'little')
-          total = block * blocks
-          print(f'grow: container is {total} bytes, wanted {want}')
-          assert want - 64 * 1024 * 1024 <= total <= want, 'container did not grow to the requested size'
+          image, mib = Path(sys.argv[1]), int(sys.argv[2])
+          with image.open('wb') as stream:
+              stream.truncate(mib * 1024 * 1024)
+          print(f'raw image {image} truncated to {mib} MiB')
           PY
+          # 2. attach as a raw disk image and make the container fill the device
+          hdiutil attach -nobrowse -owners off -plist \
+            -imagekey diskimage-class=CRawDiskImage "$raw" > "$RUNNER_TEMP/attach.plist"
+          device=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][0]['dev-entry'])" "$RUNNER_TEMP/attach.plist")
+          echo "attached $device"
+          diskutil apfs create "$device" OwnerData
+          volume=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][-1]['dev-entry'])" "$RUNNER_TEMP/attach.plist")
+          # 3. mount it and copy the OS volume's private/var in
+          mount="$RUNNER_TEMP/seed-work/mount"
+          mkdir -p "$mount"
+          diskutil mount -mountPoint "$mount" "$volume"
+          rsync -a --exclude 'staged_system_apps' \
+            "$RUNNER_TEMP/os-mount/private/var/" "$mount/"
+          mkdir -p "$mount/keybags" "$mount/mobile/tmp" "$mount/tmp" "$mount/run"
+          chmod 1777 "$mount/tmp"
+          # 4. record what it made, then detach
+          diskutil info -plist "$volume" > "$RUNNER_TEMP/volume.plist"
+          python3 - "$RUNNER_TEMP/volume.plist" "$RUNNER_TEMP/out/volume.json" <<'PY'
+          import json, plistlib, sys
+          info = plistlib.load(open(sys.argv[1], 'rb'))
+          json.dump({'volume_uuid': info.get('VolumeUUID'), 'size': info.get('Size'),
+                     'free': info.get('FreeSpace', 0)},
+                    open(sys.argv[2], 'w'), indent=2)
+          print('volume', info.get('VolumeUUID'), info.get('Size'), 'free', info.get('FreeSpace', 0))
+          PY
+          df -h "$RUNNER_TEMP" >> "$GITHUB_STEP_SUMMARY"
+          hdiutil detach "$device" -force
 
-      - name: Re-pack the grown image
+      - name: Pack the seed
         run: |
           set -euo pipefail
-          trap 'echo "::error title=Re-pack the grown image::$BASH_COMMAND"' ERR
+          trap 'echo "::error title=Pack the seed::$BASH_COMMAND"' ERR
           python3 - <<'PY'
           import hashlib, json, os, sys
           from pathlib import Path
@@ -185,19 +182,18 @@ jobs:
           import packed_ramdisk
           image = temp / 'seed-work/owner-data.cdr'
           output = temp / 'out/nx769j-data.dbr'
-          output.unlink(missing_ok=True)
+          header = image.open('rb').read(4096)
+          assert header[32:36] == b'NXSB', 'not an APFS container'
+          block = int.from_bytes(header[36:40], 'little')
+          blocks = int.from_bytes(header[40:48], 'little')
           packed_ramdisk.pack(image, output)
-          base = json.loads((temp / 'out/base.json').read_text())
+          volume = json.loads((temp / 'out/volume.json').read_text())
           report = {
-              'os_mount': base.get('os_mount'),
-              'os_launchd_sha256': base.get('os_launchd_sha256'),
-              'volume_uuid': base.get('volume_uuid'),
+              'os_launchd_sha256': hashlib.sha256(
+                  Path(os.environ['RUNNER_TEMP'], 'os-mount/sbin/launchd').read_bytes()).hexdigest(),
+              'volume_uuid': volume['volume_uuid'],
               'size_mib': int(os.environ['SIZE_MIB']),
-              'base_size_mib': int(os.environ['BASE_MIB']),
-              'files': base.get('files'),
-              'file_bytes': base.get('file_bytes'),
-              'skipped_dirs': base.get('skipped_dirs'),
-              'disabled_jobs': base.get('disabled_jobs'),
+              'container_bytes': block * blocks,
               'output': str(output),
               'output_sha256': hashlib.sha256(output.read_bytes()).hexdigest(),
               'output_bytes': output.stat().st_size,
