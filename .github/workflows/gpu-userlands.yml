@@ -142,8 +142,10 @@ jobs:
               stream.truncate(mib * 1024 * 1024)
           print(f'raw image {image} truncated to {mib} MiB')
           PY
-          # 2. attach as a raw disk image and make the container fill the device
-          hdiutil attach -nobrowse -owners off -plist \
+          # 2. attach as a raw disk image and make the container fill the device.
+          # -nomount: the file is all zeroes, so there is no filesystem to mount
+          #   yet and hdiutil would otherwise fail with "no mountable file systems".
+          hdiutil attach -nomount -nobrowse -owners off -plist \
             -imagekey diskimage-class=CRawDiskImage "$raw" > "$RUNNER_TEMP/attach.plist"
           device=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][0]['dev-entry'])" "$RUNNER_TEMP/attach.plist")
           echo "attached $device"
