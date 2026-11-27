@@ -1,38 +1,56 @@
-# Build the NX769J GPU user space (Turnip + NativeAdrenoMetal.bundle + vktest)
-# on a GitHub-hosted macOS runner, so no local Mac is needed.
-name: gpu-userlands
+name: Data seed
+
+# The writable Data volume's seed for the payload (unixnu build payload
+# --data-ramdisk), built on a hosted macOS runner because every step needs
+# hdiutil and diskutil apfs.
+#
+# Two phases, because a 100 GiB raw image does not fit on a hosted runner:
+#
+#   1. build a small seed the normal way (scripts/build-data-seed.py at BASE_MIB)
+#   2. extend only the image *file* with `hdiutil resize` (APFS makes the
+#      extension sparse, so the runner's disk usage stays at BASE_MIB), grow the
+#      APFS container to fill it with `diskutil apfs resizeContainer ... 0`, and
+#      re-pack with DarwinBoot's DBRDISK1 writer -- the packed seed only carries
+#      non-zero pages, so the artifact stays small while the volume the kernel
+#      presents is the full size asked for.
+#
+# If step 2 fails the workflow still uploads the BASE_MIB seed so a bootable
+# build is never blocked on the resize.
+#
+# The seed is rebuilt from scratch on every run, so the Data volume UUID changes
+# with it; the report prints the UUID that this run produced.
 
 on:
   workflow_dispatch:
+    inputs:
+      size_mib:
+        description: Final Data container size in MiB (the volume the kernel presents)
+        required: true
+        default: "102400"
 
 permissions:
   contents: read
 
-jobs:
-  userlands:
-    runs-on: macos-26
-    timeout-minutes: 180
-    env:
-      ADRENOMETAL_PIN: c6d29caad6d880cc8204ebe3bc34d77479a3255d
-      ADRENOPM4_PIN: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
-      GOPFRAMEBUFFER_PIN: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
-      METAL2VULKAN_PIN: 720ef1ce9ae2a2068999a8675717418b9416283e
-      MESA_PIN: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
-      GIT_TERMINAL_PROMPT: '0'
-    steps:
-      - name: Show the run environment
-        run: |
-          echo "runner: $RUNNER_OS $RUNNER_ARCH"
-          sw_vers
-          xcodebuild -version || true
-          xcrun --sdk iphoneos --show-sdk-path || true
-          echo "pins: $ADRENOMETAL_PIN $ADRENOPM4_PIN $GOPFRAMEBUFFER_PIN $METAL2VULKAN_PIN $MESA_PIN"
+env:
+  # The whole restore image and the OS member, both pinned. The member pin is
+  # also in os-profiles/ios-16.5-20F66/profile.toml [ipsw.sha256] and the build
+  # checks it, so a mismatch here stops before anything is mounted.
+  IPSW_SHA256: c1091c401f67e3aa7cdfeb2cc19e6c79be3c957aae4e097a019e9ccea07d52f2
+  OS_MEMBER: 096-04088-077.dmg
+  IPSW_URL: https://updates.cdn-apple.com/2023SpringFCS/fullrestores/032-85130/6AB0D10A-8AF9-4F6C-8CF5-A1B315CABE88/iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
+  SIZE_MIB: ${{ inputs.size_mib || '102400' }}
+  # The size the image is actually created at; the rest is a sparse extension.
+  BASE_MIB: "8192"
 
+jobs:
+  seed:
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
       - name: Check out the device repository
         uses: actions/checkout@v4
         with:
           repository: xwsjjctz/UniXNU-NX769J
-          ref: main
           path: device
           persist-credentials: false
 
@@ -46,161 +64,163 @@ jobs:
 
       - name: Drop the runner's GitHub credential rewriting
         run: |
-          set -uxo pipefail
           git config --global --unset-all url.https://github.com/.insteadOf || true
-          git config --global --unset-all url.https://github.com/.insteadof || true
           git config --global --unset-all http.https://github.com/.extraheader || true
-          git config --global --get-regexp '^url\.|^http\.' || true
 
-      - name: Fetch Mesa at its pinned revision
-        run: |
-          set -euxo pipefail
-          M=$PWD/unixnu/.cache/mesa-work
-          rm -rf "$M"
-          git init "$M"
-          git -C "$M" remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
-          git -C "$M" fetch --depth 1 origin "$MESA_PIN"
-          git -C "$M" checkout --detach FETCH_HEAD
-          test "$(git -C "$M" rev-parse HEAD)" = "$MESA_PIN"
-
-      - name: Apply the recorded Mesa patches
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          import json, subprocess
-          from pathlib import Path
-          U = Path('unixnu').resolve()
-          pins = json.loads((U / 'scripts/data/adreno-compiler-inputs.json').read_text())
-          M = U / '.cache/mesa-work'
-          for patch in pins['patches']:
-              subprocess.run(['git', '-C', str(M), 'apply', '--whitespace=nowarn', str(U / patch)], check=True)
-          print('applied %d Mesa patches' % len(pins['patches']))
-          PY
-          git -C unixnu/.cache/mesa-work status --porcelain | head -40
-
-      - name: Fetch metal2vulkan at its pinned revision
-        run: |
-          set -euxo pipefail
-          M=$PWD/device/.cache/gpu-user/metal2vulkan
-          rm -rf "$M"
-          git init "$M"
-          git -C "$M" remote add origin https://github.com/steelbrain/metal2vulkan
-          git -C "$M" fetch --depth 1 origin "$METAL2VULKAN_PIN"
-          git -C "$M" checkout --detach FETCH_HEAD
-
-      - name: Fetch and pin the submodules
-        run: |
-          set -euxo pipefail
-          for path in drivers/AdrenoMetal drivers/Adreno740 kits/AdrenoPM4 drivers/GopFramebuffer; do
-            git -C unixnu submodule update --init --depth 1 "$path" || git -C unixnu submodule update --init "$path"
-          done
-          git -C unixnu/drivers/AdrenoMetal fetch --depth 1 origin "$ADRENOMETAL_PIN" || true
-          git -C unixnu/drivers/AdrenoMetal checkout --detach "$ADRENOMETAL_PIN"
-          git -C unixnu/kits/AdrenoPM4 fetch --depth 1 origin "$ADRENOPM4_PIN" || true
-          git -C unixnu/kits/AdrenoPM4 checkout --detach "$ADRENOPM4_PIN"
-          git -C unixnu/drivers/GopFramebuffer fetch --depth 1 origin "$GOPFRAMEBUFFER_PIN" || true
-          git -C unixnu/drivers/GopFramebuffer checkout --detach "$GOPFRAMEBUFFER_PIN"
-          git -C unixnu/drivers/AdrenoMetal rev-parse HEAD
-          git -C unixnu/kits/AdrenoPM4 rev-parse HEAD
-          git -C unixnu/drivers/GopFramebuffer rev-parse HEAD
-
-      - name: Stage the .cache/gpu-user inputs
-        run: |
-          set -euxo pipefail
-          C=$PWD/device/.cache/gpu-user
-          mkdir -p "$C/nativemetal" "$C/AdrenoPM4" "$C/NativeMobileDisplay"
-          git -C unixnu/drivers/AdrenoMetal archive "$ADRENOMETAL_PIN" | tar -x -C "$C/nativemetal"
-          git -C unixnu/kits/AdrenoPM4 archive "$ADRENOPM4_PIN" | tar -x -C "$C/AdrenoPM4"
-          cp unixnu/drivers/GopFramebuffer/NativeGOPWire.h "$C/NativeMobileDisplay/NativeGOPWire.h"
-          ls -l "$C"
-
-      - name: Install the build tools
-        run: |
-          set -euxo pipefail
-          brew install bison glslang shaderc spirv-tools llvm || brew upgrade bison glslang shaderc spirv-tools llvm || true
-          python3 -m venv unixnu/.cache/mesa-venv
-          unixnu/.cache/mesa-venv/bin/pip install --upgrade pip
-          unixnu/.cache/mesa-venv/bin/pip install packaging setuptools wheel mako pyyaml meson ninja
-          rustup toolchain install 1.98.0 --profile minimal
-          rustup target add --toolchain 1.98.0 aarch64-apple-ios
-          rustup target add aarch64-apple-ios || true
-          rustup show
-          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
-
-      - name: Add the iOS 16 target to build-turnip-darwin.py
+      # Only DarwinBoot is needed, and it is a submodule rather than part of the
+      # tree. Its Test/packed_ramdisk.py is the DBRDISK1 writer the seed packs
+      # with; the rest of the submodules are not worth fetching.
+      - name: Fetch the DarwinBoot submodule
         run: |
           set -euo pipefail
+          git -C unixnu submodule update --init --depth 1 drivers/DarwinBoot
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the iOS 16.5 restore image
+        run: |
+          set -euo pipefail
+          trap 'echo "::error title=Fetch the restore image::$BASH_COMMAND"' ERR
+          {
+            echo '## Data seed'
+            echo '### Runner disk before'
+            echo '```'
+            df -h "$RUNNER_TEMP"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/ipsw"
+          curl -fSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/ipsw/restore.ipsw" "$IPSW_URL"
+          echo "$IPSW_SHA256  $RUNNER_TEMP/ipsw/restore.ipsw" | shasum -a 256 -c -
+
+      - name: Extract the OS volume
+        run: |
+          set -euo pipefail
+          trap 'echo "::error title=Extract the OS volume::$BASH_COMMAND"' ERR
           python3 - <<'PY'
+          import hashlib, os, zipfile
           from pathlib import Path
-          p = Path('unixnu/scripts/build-turnip-darwin.py')
-          t = p.read_text()
-          if "'ios16'" not in t:
-              t = t.replace("choices=('host', 'ios', 'ios27', 'macos27')",
-                            "choices=('host', 'ios', 'ios16', 'ios27', 'macos27')")
-              t = t.replace("'ios': 'build/mesa-tu-ios',",
-                            "'ios': 'build/mesa-tu-ios', 'ios16': 'build/mesa-tu-ios16',")
-              t = t.replace("if args.target in ('ios', 'ios27', 'macos27'):",
-                            "if args.target in ('ios', 'ios16', 'ios27', 'macos27'):")
-              t = t.replace("triple = {'ios': 'arm64-apple-ios17.0',",
-                            "triple = {'ios': 'arm64-apple-ios17.0', 'ios16': 'arm64-apple-ios16.0',")
-              p.write_text(t)
-          print('ios16 target present')
+          ipsw = Path(os.environ['RUNNER_TEMP']) / 'ipsw/restore.ipsw'
+          out = Path(os.environ['RUNNER_TEMP']) / 'os'
+          out.mkdir(parents=True, exist_ok=True)
+          member = os.environ['OS_MEMBER']
+          import tomllib
+          pin = tomllib.loads(Path('device/os-profiles/ios-16.5-20F66/profile.toml')
+                              .read_text(encoding='utf-8'))['ipsw']['sha256'][member]
+          with zipfile.ZipFile(ipsw) as archive, archive.open(member) as source:
+              digest = hashlib.sha256()
+              with (out / member).open('wb') as target:
+                  while chunk := source.read(8 * 1024 * 1024):
+                      target.write(chunk)
+                      digest.update(chunk)
+          if digest.hexdigest() != pin:
+              raise SystemExit(f'{member} hashes to {digest.hexdigest()}, the profile pins {pin}')
+          print(f'{member} {digest.hexdigest()} extracted')
+          PY
+          rm -f "$RUNNER_TEMP/ipsw/restore.ipsw"
+
+      - name: Mount the OS volume read-only
+        run: |
+          set -euo pipefail
+          trap 'echo "::error title=Mount the OS volume::$BASH_COMMAND"' ERR
+          mkdir -p "$RUNNER_TEMP/os-mount"
+          hdiutil attach -readonly -nobrowse -owners off \
+            -mountpoint "$RUNNER_TEMP/os-mount" "$RUNNER_TEMP/os/$OS_MEMBER"
+
+      - name: Build the base seed
+        id: base
+        run: |
+          set -euo pipefail
+          trap 'echo "::error title=Build the base seed::$BASH_COMMAND"' ERR
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 device/scripts/build-data-seed.py \
+            --os-mount "$RUNNER_TEMP/os-mount" \
+            --output "$RUNNER_TEMP/out/nx769j-data.dbr" \
+            --size-mib "$BASE_MIB" \
+            --unixnu unixnu \
+            --work "$RUNNER_TEMP/seed-work" > "$RUNNER_TEMP/out/build-data-seed.log" 2>&1
+          cat "$RUNNER_TEMP/out/build-data-seed.log"
+          cp "$RUNNER_TEMP/out/nx769j-data.dbr.json" "$RUNNER_TEMP/out/base.json"
+          df -h "$RUNNER_TEMP" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Grow the image and the container to the requested size
+        id: grow
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/seed-work/owner-data.cdr"
+          echo "grow: extending $image to ${SIZE_MIB}m"
+          hdiutil resize -size "${SIZE_MIB}m" -imagekey diskimage-class=CRawDiskImage "$image"
+          ls -l "$image"
+          mount="$RUNNER_TEMP/seed-work/mount2"
+          mkdir -p "$mount"
+          attached="$RUNNER_TEMP/attach.plist"
+          hdiutil attach -nobrowse -owners off -plist "$image" > "$attached"
+          device=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['system-entities'][0]['dev-entry'])" "$attached")
+          echo "grow: container on $device"
+          diskutil apfs resizeContainer "$device" 0
+          hdiutil detach "$device" -force
+          python3 - "$image" "$SIZE_MIB" <<'PY'
+          import sys
+          from pathlib import Path
+          image, want = Path(sys.argv[1]), int(sys.argv[2]) * 1024 * 1024
+          header = image.open('rb').read(4096)
+          assert header[32:36] == b'NXSB', 'not an APFS container'
+          block = int.from_bytes(header[36:40], 'little')
+          blocks = int.from_bytes(header[40:48], 'little')
+          total = block * blocks
+          print(f'grow: container is {total} bytes, wanted {want}')
+          assert want - 64 * 1024 * 1024 <= total <= want, 'container did not grow to the requested size'
           PY
 
-      - name: Build Turnip for iOS 16
+      - name: Re-pack the grown image
         run: |
-          set -euxo pipefail
-          python3 unixnu/scripts/build-turnip-darwin.py --target ios16
-          ls -l unixnu/build/mesa-tu-ios16/src/freedreno/vulkan/libvulkan_freedreno.dylib
-
-      - name: Build the GPU user lands
-        run: |
-          set -euxo pipefail
-          bash device/scripts/build-nx769j-metal.sh "$PWD/unixnu"
-          ls -lR device/.cache/gpu-user/out | head -80
-
-      - name: Ad-hoc sign the GPU user lands
-        run: |
-          set -euxo pipefail
-          OUT=device/.cache/gpu-user/out
-          if [ -d "$OUT/NativeAdrenoMetal.bundle" ]; then
-            codesign --force --sign - --timestamp=none "$OUT/NativeAdrenoMetal.bundle"
-          fi
-          for f in "$OUT/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib" "$OUT/vktest" "$OUT/mtltest"; do
-            if [ -f "$f" ]; then codesign --force --sign - --timestamp=none "$f"; fi
-          done
+          set -euo pipefail
+          trap 'echo "::error title=Re-pack the grown image::$BASH_COMMAND"' ERR
           python3 - <<'PY'
-          import json, pathlib, re, subprocess
-          out = pathlib.Path('device/.cache/gpu-user/out')
-          paths = [out / 'NativeAdrenoMetal.bundle/NativeAdrenoMetal',
-                   out / 'NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib',
-                   out / 'vktest', out / 'mtltest']
-          result = {}
-          for path in paths:
-              if not path.is_file():
-                  continue
-              info = subprocess.run(['codesign', '--display', '--verbose=4', str(path)],
-                                    capture_output=True, text=True)
-              match = re.search(r'CDHash=([0-9a-f]+)', info.stderr)
-              result[path.name] = match.group(1) if match else None
-          (out / 'cdhashes.json').write_text(json.dumps(result, indent=1) + '\n')
-          print(result)
+          import hashlib, json, os, sys
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          sys.path.insert(0, str(Path('unixnu/drivers/DarwinBoot/Test').resolve()))
+          import packed_ramdisk
+          image = temp / 'seed-work/owner-data.cdr'
+          output = temp / 'out/nx769j-data.dbr'
+          output.unlink(missing_ok=True)
+          packed_ramdisk.pack(image, output)
+          base = json.loads((temp / 'out/base.json').read_text())
+          report = {
+              'os_mount': base.get('os_mount'),
+              'os_launchd_sha256': base.get('os_launchd_sha256'),
+              'volume_uuid': base.get('volume_uuid'),
+              'size_mib': int(os.environ['SIZE_MIB']),
+              'base_size_mib': int(os.environ['BASE_MIB']),
+              'files': base.get('files'),
+              'file_bytes': base.get('file_bytes'),
+              'skipped_dirs': base.get('skipped_dirs'),
+              'disabled_jobs': base.get('disabled_jobs'),
+              'output': str(output),
+              'output_sha256': hashlib.sha256(output.read_bytes()).hexdigest(),
+              'output_bytes': output.stat().st_size,
+              'hardware_tested': False,
+          }
+          Path(str(output) + '.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(report, indent=2))
           PY
+          {
+            echo '### Seed'
+            echo '```'
+            cat "$RUNNER_TEMP/out/nx769j-data.dbr.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Dump diagnostics on failure
-        if: failure()
-        run: |
-          echo '### Diagnostics' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          (cd unixnu && git log --oneline -1) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          (cd unixnu/.cache/mesa-work && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          (cd device/.cache/gpu-user/metal2vulkan && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Unmount the OS volume
+        if: always()
+        run: hdiutil detach "$RUNNER_TEMP/os-mount" -force || true
 
-      - name: Upload the user lands
-        if: success()
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: nx769j-gpu-user
-          path: device/.cache/gpu-user/out
+          name: nx769j-data-seed
+          path: ${{ runner.temp }}/out/*
           if-no-files-found: error
+          retention-days: 7
