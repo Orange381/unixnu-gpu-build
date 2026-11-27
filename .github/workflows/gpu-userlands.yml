@@ -69,7 +69,7 @@ jobs:
           python3 - <<'PY'
           import json, subprocess
           from pathlib import Path
-          U = Path('unixnu')
+          U = Path('unixnu').resolve()
           pins = json.loads((U / 'scripts/data/adreno-compiler-inputs.json').read_text())
           M = U / '.cache/mesa-work'
           for patch in pins['patches']:
