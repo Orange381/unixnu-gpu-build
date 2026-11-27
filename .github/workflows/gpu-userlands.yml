@@ -13,13 +13,12 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 180
     env:
-      DEVICE_REPO: xwsjjctz/UniXNU-NX769J
-      UNIXNU_REPO: UniXNU/UniXNU
       ADRENOMETAL_PIN: c6d29caad6d880cc8204ebe3bc34d77479a3255d
       ADRENOPM4_PIN: 445f8fe6d115738352b9d78dc70af6d61aa7f62f
       GOPFRAMEBUFFER_PIN: 8666a9950c9699b368931d18cac92c0fdb2ce9c0
       METAL2VULKAN_PIN: 720ef1ce9ae2a2068999a8675717418b9416283e
       MESA_PIN: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+      GIT_TERMINAL_PROMPT: '0'
     steps:
       - name: Show the run environment
         run: |
@@ -45,18 +44,37 @@ jobs:
           path: unixnu
           persist-credentials: false
 
+      - name: Check out Mesa at its pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: mesa3d/mesa
+          ref: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+          path: unixnu/.cache/mesa-work
+          fetch-depth: 1
+
+      - name: Check out metal2vulkan at its pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: steelbrain/metal2vulkan
+          ref: 720ef1ce9ae2a2068999a8675717418b9416283e
+          path: device/.cache/gpu-user/metal2vulkan
+          fetch-depth: 1
+
       - name: Fetch and pin the submodules
         run: |
           set -euxo pipefail
           for path in drivers/AdrenoMetal drivers/Adreno740 kits/AdrenoPM4 drivers/GopFramebuffer; do
             git -C unixnu submodule update --init --depth 1 "$path" || git -C unixnu submodule update --init "$path"
           done
-          git -C unixnu/drivers/AdrenoMetal fetch --depth 1 origin "$ADRENOMETAL_PIN"
+          git -C unixnu/drivers/AdrenoMetal fetch --depth 1 origin "$ADRENOMETAL_PIN" || true
           git -C unixnu/drivers/AdrenoMetal checkout --detach "$ADRENOMETAL_PIN"
-          git -C unixnu/kits/AdrenoPM4 fetch --depth 1 origin "$ADRENOPM4_PIN"
+          git -C unixnu/kits/AdrenoPM4 fetch --depth 1 origin "$ADRENOPM4_PIN" || true
           git -C unixnu/kits/AdrenoPM4 checkout --detach "$ADRENOPM4_PIN"
-          git -C unixnu/drivers/GopFramebuffer fetch --depth 1 origin "$GOPFRAMEBUFFER_PIN"
+          git -C unixnu/drivers/GopFramebuffer fetch --depth 1 origin "$GOPFRAMEBUFFER_PIN" || true
           git -C unixnu/drivers/GopFramebuffer checkout --detach "$GOPFRAMEBUFFER_PIN"
+          git -C unixnu/drivers/AdrenoMetal rev-parse HEAD
+          git -C unixnu/kits/AdrenoPM4 rev-parse HEAD
+          git -C unixnu/drivers/GopFramebuffer rev-parse HEAD
 
       - name: Stage the .cache/gpu-user inputs
         run: |
@@ -66,26 +84,9 @@ jobs:
           git -C unixnu/drivers/AdrenoMetal archive "$ADRENOMETAL_PIN" | tar -x -C "$C/nativemetal"
           git -C unixnu/kits/AdrenoPM4 archive "$ADRENOPM4_PIN" | tar -x -C "$C/AdrenoPM4"
           cp unixnu/drivers/GopFramebuffer/NativeGOPWire.h "$C/NativeMobileDisplay/NativeGOPWire.h"
-          rm -rf "$C/metal2vulkan"
-          git init "$C/metal2vulkan"
-          git -C "$C/metal2vulkan" remote add origin https://github.com/steelbrain/metal2vulkan
-          git -C "$C/metal2vulkan" fetch --depth 1 origin "$METAL2VULKAN_PIN"
-          git -C "$C/metal2vulkan" checkout --detach FETCH_HEAD
           ls -l "$C"
-
-      - name: Clone Mesa at its pinned revision
-        run: |
-          set -euxo pipefail
-          M=$PWD/unixnu/.cache/mesa-work
-          rm -rf "$M"
-          git init "$M"
-          git -C "$M" remote add origin https://github.com/mesa3d/mesa
-          if ! git -C "$M" fetch --depth 1 origin "$MESA_PIN"; then
-            echo "::warning::shallow fetch by sha failed, retrying with a blobless full fetch"
-            git -C "$M" fetch --filter=blob:none --tags origin
-          fi
-          git -C "$M" checkout --detach "$MESA_PIN"
-          git -C "$M" rev-parse HEAD
+          git -C "$C/metal2vulkan" rev-parse HEAD
+          git -C unixnu/.cache/mesa-work rev-parse HEAD
 
       - name: Install the build tools
         run: |
@@ -135,8 +136,8 @@ jobs:
           echo '### Diagnostics' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           (cd unixnu && git log --oneline -1) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          (cd unixnu/drivers/AdrenoMetal && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          (cd unixnu/.cache/mesa-work && git rev-parse HEAD && git log --oneline -1) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          (cd unixnu/.cache/mesa-work && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          (cd device/.cache/gpu-user/metal2vulkan && git rev-parse HEAD) 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the user lands
@@ -146,4 +147,3 @@ jobs:
           name: nx769j-gpu-user
           path: device/.cache/gpu-user/out
           if-no-files-found: error
-
